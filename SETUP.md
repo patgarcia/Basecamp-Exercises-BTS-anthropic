@@ -22,7 +22,7 @@ It walks you through everything:
 
 1. **Installs [uv](https://docs.astral.sh/uv/)** if you don't have it (it asks first). uv
    manages the exercises' Python packages.
-2. **Asks for your key** (the input is hidden) and saves it to `.env` at the repo root, which
+2. **Asks for your key** and saves it to `.env` at the repo root, which
    is gitignored, so it's never committed. It recognizes what you paste:
    - an **Anthropic API key** (`sk-ant-…`): nothing else to answer.
    - an **Amazon Bedrock API key**: it asks for your AWS region.

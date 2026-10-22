@@ -15,7 +15,7 @@ Only the standard library is imported at the top: the setup half runs before any
 installed.
 """
 
-import getpass
+import functools
 import json
 import os
 import pathlib
@@ -226,13 +226,24 @@ def _status(ok, msg):
         from IPython.display import HTML, display
         color = "#1a7f37" if ok else "#b42318"
         bg = "#e6f4ea" if ok else "#fdecea"
+        mark = '<span style="color:rgb(78,185,100);">✓</span>' if ok else "✗"
         display(HTML(
             f'<div style="padding:12px 16px;border-radius:8px;background:{bg};'
             f'border:1.5px solid {color};color:{color};font-weight:600;'
-            f'font-size:15px;font-family:sans-serif;">{"✓" if ok else "✗"} {msg}</div>'
+            f'font-size:15px;font-family:sans-serif;">{mark} {msg}</div>'
         ))
     else:
-        print(("✓ " if ok else "✗ ") + msg)
+        print((_check_mark() if ok else "✗") + " " + msg)
+
+
+@functools.lru_cache(maxsize=None)
+def _check_mark():
+    """✓ in green (rgb 78,185,100) when the terminal shows color; a plain ✓ otherwise."""
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return "✓"
+    if os.name == "nt":
+        os.system("")  # switches on color codes in older Windows consoles
+    return "\033[38;2;78;185;100m✓\033[0m"
 
 
 def _stop(head, body):
@@ -261,6 +272,10 @@ def main():
         # buffering keeps these messages in order with uv's own output.
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace", line_buffering=True)
+    try:
+        import readline  # noqa: F401 — without it, macOS cuts a pasted key off at 1,024 characters
+    except ImportError:  # Windows doesn't need it
+        pass
     print("Partner Basecamp setup\n")
     uv = _find_uv() or _install_uv()
     _ask_credentials()
@@ -269,7 +284,7 @@ def main():
     _step("Registering the Jupyter kernel")
     _run([uv, "run", "--no-sync", "python", "-m", "ipykernel", "install", "--user",
           "--name", KERNEL_NAME, "--display-name", KERNEL_DISPLAY_NAME], quiet=True)
-    print(f"✓ Kernel \"{KERNEL_DISPLAY_NAME}\" is available in VS Code and Jupyter.")
+    print(f"{_check_mark()} Kernel \"{KERNEL_DISPLAY_NAME}\" is available in VS Code and Jupyter.")
     _point_vscode_at_venv()
     _step("Checking your connection to Claude")
     check = subprocess.run([uv, "run", "--no-sync", "python", "-c",
@@ -277,8 +292,9 @@ def main():
     if check.returncode != 0:
         raise SystemExit("\nSetup finished, but the connection check failed — fix what it "
                          f"says above, then run  {SETUP_COMMAND}  again.")
-    print(f"\n✓ All set. Open any notebook in VS Code; if it doesn't pick the kernel by itself, "
-          f"click the kernel name (top right) and choose \"{KERNEL_DISPLAY_NAME}\".")
+    print(f"\n{_check_mark()} You're all set! Open any notebook in VS Code; if it doesn't pick the "
+          f"kernel by itself, click the kernel name (top right) and choose \"{KERNEL_DISPLAY_NAME}\".")
+    _open_vscode()
 
 
 def _step(title):
@@ -366,7 +382,23 @@ def _point_vscode_at_venv():
     settings["python.defaultInterpreterPath"] = python
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    print("✓ VS Code will use .venv for this folder.")
+    print(f"{_check_mark()} VS Code will use .venv for this folder.")
+
+
+def _open_vscode():
+    """Offer to open the repo root in VS Code, if its `code` command is on PATH."""
+    if os.environ.get("TERM_PROGRAM") == "vscode":
+        return  # running in VS Code's own terminal: it's already open
+    code = shutil.which("code")
+    if not code or not sys.stdin.isatty():
+        print(f"Next: open VS Code, choose File → Open Folder…, and pick {ROOT}")
+        return
+    try:
+        input("\nHit Enter to open VS Code (Ctrl+C to skip): ")
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    subprocess.run([code, str(ROOT)])
 
 
 # ── Credentials → .env ───────────────────────────────────────────────────────
@@ -385,13 +417,12 @@ def _ask_credentials():
     if summary and _ask_yes_no(f"Your .env already has {summary}. Keep it?", default=True):
         return
 
+    print("Paste your key: an Anthropic API key, a company gateway key, or an Amazon Bedrock API key.")
     while True:
-        key = getpass.getpass("Paste your key — Anthropic API key, company gateway key, or "
-                              "Amazon Bedrock API key (input is hidden): ").strip()
+        key = input("Key: ").strip()
         if not key:
             print("  Nothing pasted — try again (Ctrl+C to quit).")
             continue
-        print(f"  Got {_mask(key)}")
         if key.startswith("sk-ant-"):
             values = {"ANTHROPIC_API_KEY": key}
             break
@@ -419,7 +450,7 @@ def _ask_credentials():
         break
 
     _write_env({name: values.get(name, "") for name in ENV_KEYS})
-    print(f"✓ Saved to {ENV_FILE} (gitignored — never committed).")
+    print(f"{_check_mark()} Saved to {ENV_FILE} (gitignored — never committed).")
 
 
 def _ask(question, default=""):
