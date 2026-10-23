@@ -139,6 +139,13 @@ setup script again:
 - Windows: `winget install --id=astral-sh.uv -e`
 - Anything else: [docs.astral.sh/uv/getting-started/installation](https://docs.astral.sh/uv/getting-started/installation/)
 
+### "Couldn't reach …" or a timeout
+The endpoint didn't answer within a few seconds, so the network is in the way, not your key.
+For a company gateway, check you're on the company VPN; if you are, switch to your phone's
+hotspot, keep the VPN on, and try again. For the Anthropic API or Bedrock, the network
+you're on may be blocking it: switch to your phone's hotspot. During setup, the script waits
+for you to switch and press Enter, then tries again.
+
 ### Corporate proxy, blocked PyPI, or certificate errors
 - **Behind a proxy:** set it before running the script.
   ```bash

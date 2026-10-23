@@ -17,6 +17,7 @@ Only the standard library is imported at the top: the setup half runs before any
 installed.
 """
 
+import contextlib
 import functools
 import json
 import os
@@ -25,6 +26,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent  # the repo root: the folder with day1/ and day2/
@@ -38,6 +41,11 @@ DEFAULT_MODEL_PREFIX = "bedrock.anthropic."  # what PwC's Bedrock gateway expect
 ENV_KEYS = ("ANTHROPIC_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION",
             "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL_PREFIX")
 TLS_MODES = ("default", "system+bundle", "system")  # values of BASECAMP_TLS; see check_tls()
+TLS_LABELS = {"default": "the default certificates",
+              "system+bundle": "the system store plus SSL_CERT_FILE",
+              "system": "the system store"}
+EXIT_UNREACHABLE = 2  # a check's exit code when the endpoint didn't answer: worth a retry
+SPINNER = ("·", "✢", "✳", "✶", "✻", "✽")  # Claude's asterisk, growing; played back and forth
 
 
 # =============================================================================
@@ -157,6 +165,10 @@ class Connection:
         return self.provider == "anthropic" and not self.base_url
 
 
+class Unreachable(SystemExit):
+    """connect() got no answer from the endpoint: a network problem, not a settings one."""
+
+
 def connect(model="claude-sonnet-5", fast_model="claude-haiku-4-5", big_model="claude-opus-4-8"):
     """Build a Claude client from your settings and prove it works, or stop with a clear
     banner saying what to fix. Model names are bare IDs; they come back resolved for your route.
@@ -194,10 +206,11 @@ def connect(model="claude-sonnet-5", fast_model="claude-haiku-4-5", big_model="c
 
     # Ping the real model, not just the credential's shape: on Bedrock or a gateway a valid
     # key can still 404 if the model isn't enabled for you, or the gateway wants another ID.
-    probe = settings.make_client(timeout=30.0, max_retries=1)
+    probe = settings.make_client(timeout=anthropic.Timeout(30.0, connect=10.0), max_retries=1)
     try:
-        probe.messages.create(model=connection.fast_model, max_tokens=1,
-                              messages=[{"role": "user", "content": "ping"}])
+        _timed(f"Calling {connection.fast_model}",
+               lambda: probe.messages.create(model=connection.fast_model, max_tokens=1,
+                                             messages=[{"role": "user", "content": "ping"}]))
     except anthropic.NotFoundError:
         if gateway:
             _status(False, f"Reached the gateway at {gateway}, but it doesn't know model "
@@ -228,6 +241,9 @@ def connect(model="claude-sonnet-5", fast_model="claude-haiku-4-5", big_model="c
                            f"terminal at the repo root, run  {SETUP_COMMAND} --check-tls  to test "
                            "this machine's certificates, then run this again.")
             raise SystemExit("Certificate check failed — see the message above.")
+        if isinstance(exc, anthropic.APIConnectionError):
+            _status(False, _unreachable(settings, exc))
+            raise Unreachable("No answer from the endpoint — see the message above.")
         _status(False, f"Could not reach the API{via} ({type(exc).__name__}). Check your "
                        "connection (and VPN, for a company gateway), then try again.")
         raise
@@ -253,7 +269,8 @@ def connect(model="claude-sonnet-5", fast_model="claude-haiku-4-5", big_model="c
 
 def check_tls():
     """Test which certificates verify your Claude endpoint and save the answer to .env as
-    BASECAMP_TLS (left unset when the SDK's default works). True if one works."""
+    BASECAMP_TLS (left unset when the SDK's default works). True if one works, False if none
+    does, None if the endpoint didn't answer at all."""
     settings = Settings()
     saved, settings.tls = settings.tls, "default"  # test from scratch, whatever is saved
     if settings.problem():
@@ -269,12 +286,12 @@ def check_tls():
     modes = ["default"] + (["system+bundle", "system"] if os.path.isfile(bundle)
                            else ["system"] if bundle else [])
     for mode in modes:
-        works = _tls_reaches(url, mode)
-        if works is None:
-            print(f"✗ Couldn't reach {host} at all, so certificates couldn't be tested. Check "
-                  f"your network (and VPN, for a company gateway), then run  {SETUP_COMMAND} "
-                  "--check-tls  again.")
-            return False
+        try:
+            works = _timed(f"Trying {TLS_LABELS[mode]}", lambda: _tls_reaches(url, mode),
+                           lambda ok: _check_mark() if ok else "✗ certificate rejected")
+        except Exception as exc:  # no answer at all, so certificates can't be judged
+            print("✗ " + _unreachable(settings, exc))
+            return None
         if works:
             break
     else:
@@ -316,13 +333,13 @@ def _ssl_context(mode):
 
 
 def _tls_reaches(url, mode):
-    """Whether `mode`'s certificates verify the server at url: True, False, or None when the
-    server can't be reached at all (offline, VPN, DNS), so certificates can't be judged."""
+    """Whether `mode`'s certificates verify the server at url. Raises when the server can't
+    be reached at all (offline, VPN, DNS, firewall), so certificates can't be judged."""
     import anthropic
 
     try:
         context = _ssl_context(mode)
-        http = anthropic.DefaultHttpxClient(timeout=15.0, **({"verify": context} if context else {}))
+        http = anthropic.DefaultHttpxClient(timeout=10.0, **({"verify": context} if context else {}))
     except OSError:  # e.g. SSL_CERT_FILE names a file that isn't there
         return False
     try:
@@ -330,20 +347,45 @@ def _tls_reaches(url, mode):
             http.get(url)  # any HTTP answer, even an error status, means the certificate passed
         return True
     except Exception as exc:
-        return False if _is_cert_error(exc) else None
+        if _is_cert_error(exc):
+            return False
+        # The connect timeout covers TCP, a proxy's CONNECT and the TLS handshake, so a slow
+        # reply means the certificate already passed: some gateways never answer a bare GET.
+        if any(type(cause).__name__ == "ReadTimeout" for cause in _causes(exc)):
+            return True
+        raise
+
+
+def _causes(exc):
+    """exc, then the exceptions that led to it."""
+    for _ in range(10):
+        if exc is None:
+            return
+        yield exc
+        exc = exc.__cause__ or exc.__context__
 
 
 def _is_cert_error(exc):
     """True if exc, or anything that caused it, is a failed certificate check."""
     import ssl
 
-    for _ in range(10):  # walk the chain of causes
-        if exc is None:
-            return False
-        if isinstance(exc, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):
-            return True
-        exc = exc.__cause__ or exc.__context__
-    return False
+    return any(isinstance(cause, ssl.SSLCertVerificationError)
+               or "CERTIFICATE_VERIFY_FAILED" in str(cause) for cause in _causes(exc))
+
+
+def _unreachable(settings, exc):
+    """What to try when the endpoint doesn't answer: the network is in the way, not the key."""
+    url = settings.endpoint()
+    host = urllib.parse.urlparse(url).hostname or url
+    root = list(_causes(exc))[-1]
+    why = ("it didn't answer in time" if any("Timeout" in type(cause).__name__
+                                             for cause in _causes(exc))
+           else f"{type(root).__name__}: {str(root)[:100]}")
+    if settings.base_url:
+        return (f"Couldn't reach {host} ({why}). Check you're connected to the company VPN. "
+                "If you are, switch to your phone's hotspot, keep the VPN on, and try again.")
+    return (f"Couldn't reach {host} ({why}). The network you're on may be blocking it: "
+            "switch to your phone's hotspot and try again.")
 
 
 def _in_notebook():
@@ -370,14 +412,69 @@ def _status(ok, msg):
         print((_check_mark() if ok else "✗") + " " + msg)
 
 
+def _timed(label, fn, outcome=lambda result: _check_mark()):
+    """Run fn() with a live seconds counter after label, then show the outcome and time.
+    Silent in notebooks, where the banner says it all."""
+    if _in_notebook():
+        return fn()
+    start = time.monotonic()
+    live = sys.stdout.isatty()
+    done = threading.Event()
+    frames = _spinner_frames()
+
+    def tick():
+        frame = 0
+        while not done.wait(0.12):
+            spinner = _paint(frames[frame % len(frames)], "215;119;87")  # Claude orange
+            print(f"\r{spinner} {label}… {_elapsed(start, decimals=0)}", end="", flush=True)
+            frame += 1
+
+    ticker = threading.Thread(target=tick, daemon=True)
+    if live:
+        ticker.start()
+    mark = "✗"
+    try:
+        result = fn()
+        mark = outcome(result)
+        return result
+    finally:
+        done.set()
+        if live:
+            ticker.join()
+        print(f"{chr(13) if live else ''}{label}… {mark} ({_elapsed(start)})", flush=True)
+
+
+def _elapsed(start, decimals=1):
+    seconds = time.monotonic() - start
+    if seconds < 60:
+        return f"{seconds:.{decimals}f}s"
+    return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
+
+
 @functools.lru_cache(maxsize=None)
-def _check_mark():
-    """✓ in green (rgb 78,185,100) when the terminal shows color; a plain ✓ otherwise."""
+def _colors_on():
     if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
-        return "✓"
+        return False
     if os.name == "nt":
         os.system("")  # switches on color codes in older Windows consoles
-    return "\033[38;2;78;185;100m✓\033[0m"
+    return True
+
+
+def _paint(text, rgb):
+    """text in an "r;g;b" color when the terminal shows color; plain otherwise."""
+    return f"\033[38;2;{rgb}m{text}\033[0m" if _colors_on() else text
+
+
+def _check_mark():
+    return _paint("✓", "78;185;100")
+
+
+def _spinner_frames():
+    # The classic Windows console font has no ✢ ✳ ✶ ✻ ✽; Windows Terminal and VS Code do.
+    fancy = (os.name != "nt" or os.environ.get("WT_SESSION")
+             or os.environ.get("TERM_PROGRAM") == "vscode")
+    frames = SPINNER if fancy else ("·", "+", "*")
+    return frames + frames[-2:0:-1]
 
 
 def _stop(head, body):
@@ -409,19 +506,22 @@ def main():
     print("Partner Basecamp setup\n")
     uv = _find_uv() or _install_uv()
     _ask_credentials()
-    _step("Installing the exercise packages into .venv (first run takes a minute)")
-    _sync(uv)
-    _step("Registering the Jupyter kernel")
-    _run([uv, "run", "--no-sync", "python", "-m", "ipykernel", "install", "--user",
-          "--name", KERNEL_NAME, "--display-name", KERNEL_DISPLAY_NAME], quiet=True)
-    print(f"{_check_mark()} Kernel \"{KERNEL_DISPLAY_NAME}\" is available in VS Code and Jupyter.")
-    _point_vscode_at_venv()
-    _step("Checking certificates")
-    _check_tls(uv)
-    _step("Checking your connection to Claude")
-    check = subprocess.run([uv, "run", "--no-sync", "python", "-c",
-                            "import basecamp_setup; basecamp_setup.connect()"], cwd=ROOT)
-    if check.returncode != 0:
+    with _step("Installing the exercise packages into .venv (first run takes a minute)"):
+        _sync(uv)
+    with _step("Registering the Jupyter kernel"):
+        _run([uv, "run", "--no-sync", "python", "-m", "ipykernel", "install", "--user",
+              "--name", KERNEL_NAME, "--display-name", KERNEL_DISPLAY_NAME], quiet=True)
+        print(f"{_check_mark()} Kernel \"{KERNEL_DISPLAY_NAME}\" is available in VS Code and Jupyter.")
+        _point_vscode_at_venv()
+    with _step("Checking certificates"):
+        _retry_while_unreachable(lambda: _check_tls(uv))
+    with _step("Checking your connection to Claude"):
+        code = _retry_while_unreachable(lambda: subprocess.run(
+            [uv, "run", "--no-sync", "python", "-c",
+             "import sys, basecamp_setup as b\n"
+             "try: b.connect()\n"
+             "except b.Unreachable: sys.exit(b.EXIT_UNREACHABLE)"], cwd=ROOT).returncode)
+    if code != 0:
         raise SystemExit("\nSetup finished, but the connection check failed — fix what it "
                          f"says above, then run  {SETUP_COMMAND}  again.")
     print(f"\n{_check_mark()} You're all set! Open any notebook in VS Code; if it doesn't pick the "
@@ -435,17 +535,34 @@ def check_tls_command():
     uv = _find_uv()
     if not uv or not (ROOT / ".venv").is_dir():
         raise SystemExit(f"Run the full setup first:  {SETUP_COMMAND}")
-    _step("Checking certificates")
-    if not _check_tls(uv):
+    with _step("Checking certificates"):
+        code = _check_tls(uv)
+    if code != 0:
         raise SystemExit(1)
     print("Done. If a notebook is open, run its setup cell again.")
 
 
 def _check_tls(uv):
-    """check_tls() needs the SDK, so it runs in .venv. True if it found certificates that work."""
+    """check_tls() needs the SDK, so it runs in .venv. Exit code 0 if it found certificates
+    that work, EXIT_UNREACHABLE if the endpoint didn't answer, 1 otherwise."""
     return subprocess.run([uv, "run", "--no-sync", "python", "-c",
-                           "import sys, basecamp_setup; sys.exit(not basecamp_setup.check_tls())"],
-                          cwd=ROOT).returncode == 0
+                           "import sys, basecamp_setup as b; works = b.check_tls(); "
+                           "sys.exit(b.EXIT_UNREACHABLE if works is None else not works)"],
+                          cwd=ROOT).returncode
+
+
+def _retry_while_unreachable(attempt):
+    """Run attempt(), which returns an exit code, again each time the endpoint didn't
+    answer, once the user has switched networks (VPN, hotspot) and pressed Enter."""
+    while True:
+        code = attempt()
+        if code != EXIT_UNREACHABLE or not sys.stdin.isatty():
+            return code
+        try:
+            input("Press Enter to try again (Ctrl+C to stop): ")
+        except KeyboardInterrupt:
+            print()  # end the prompt's line before the step reports its time
+            raise
 
 
 def _prepare_console():
@@ -456,8 +573,19 @@ def _prepare_console():
             stream.reconfigure(errors="replace", line_buffering=True)
 
 
-def _step(title):
+def _heading(title):
     print(f"\n── {title} ──")
+
+
+@contextlib.contextmanager
+def _step(title):
+    """A setup step: its heading, then how long it took (also when it fails)."""
+    _heading(title)
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"   Took {_elapsed(start)}.")
 
 
 def _run(cmd, quiet=False):
@@ -596,7 +724,7 @@ def _open_vscode():
 # ── Credentials → .env ───────────────────────────────────────────────────────
 
 def _ask_credentials():
-    _step("Your Claude credentials")
+    _heading("Your Claude credentials")
     if not sys.stdin.isatty():
         print("• Not an interactive terminal — keeping .env as it is.")
         return
