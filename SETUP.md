@@ -5,20 +5,26 @@
 One page to get any laptop — including a locked-down corporate one — running the
 Basecamp notebooks.
 
+> [!IMPORTANT]
+> **Setup is one command.** In a terminal at the repo root (the folder that contains `day1` and `day2`), run:
+>
+> ```bash
+> python3 basecamp_setup.py        # macOS / Linux
+> py basecamp_setup.py             # Windows (or: python basecamp_setup.py)
+> ```
+>
+> Follow the prompts. Everything below explains what it does and how to fix the rare problem it can't.
+>
+> **Using an AI coding assistant?** Ask it to "set up this repo". [AGENTS.md](AGENTS.md) tells it to open this script in a terminal window, where you paste your key yourself.
+
 ---
 
-## One command (do this once)
+## Running the setup
 
 **First, open the repo root in VS Code:** **File → Open Folder** and choose the folder that directly contains `day1`, `day2` and `basecamp_setup.py`. If you downloaded a ZIP, check you're not one level too high: some unzip tools create a nested `Basecamp-Exercises-main/Basecamp-Exercises-main/`, and the inner folder is the one you want. Open the repo root itself, not a parent folder and not an exercise folder, so VS Code finds the exercises' Python environment.
 
-Then open a terminal there (**Terminal → New Terminal**) and run:
-
-```bash
-python3 basecamp_setup.py        # macOS / Linux
-py basecamp_setup.py             # Windows — or: python basecamp_setup.py if py isn't found
-```
-
-It walks you through everything:
+Then open a terminal there (**Terminal → New Terminal**) and run the command above. It walks
+you through everything:
 
 1. **Installs [uv](https://docs.astral.sh/uv/)** if you don't have it (it asks first). uv
    manages the exercises' Python packages.
@@ -32,7 +38,9 @@ It walks you through everything:
    system Python is never modified.
 4. **Registers the "Anthropic Basecamp (.venv)" kernel** for VS Code and Jupyter, and sets VS Code to
    use `.venv` for this folder.
-5. **Checks your connection** with a real call to Claude.
+5. **Tests certificates** for your Claude endpoint and, only if this machine needs it, saves
+   the setting that works to `.env` (see [certificate errors](#corporate-proxy-blocked-pypi-or-certificate-errors)).
+6. **Checks your connection** with a real call to Claude.
 
 Then open any notebook. If VS Code hasn't picked the kernel already, click the kernel name
 (top right) and choose **Anthropic Basecamp (.venv)**. Run the setup cell; a green **✓ verified**
@@ -142,8 +150,22 @@ setup script again:
   py basecamp_setup.py
   ```
 - **Certificate errors:** networks that inspect HTTPS traffic re-sign it with a company
-  certificate. The script retries automatically with your operating system's certificates,
-  which usually trust it.
+  certificate, which your operating system's certificate store trusts. Sometimes
+  `SSL_CERT_FILE` is set on the machine and points to a certificate bundle that's missing
+  certificates, and Python tools trust that file instead. The script handles both, for the
+  exercises only (your shell and system settings are never changed):
+  - **Installing packages:** if a download fails on a certificate, it retries with your
+    system's certificate store, setting `SSL_CERT_FILE` aside for that install.
+  - **Notebooks:** it tests which certificates reach your Claude endpoint and, if the
+    default doesn't, saves the one that works to `.env` as `BASECAMP_TLS`. The setup cell
+    uses it, and its green banner says so.
+
+  If a notebook later reports a certificate error (after changing networks, or after IT
+  updates your certificates), re-test without redoing the whole setup:
+  ```bash
+  python3 basecamp_setup.py --check-tls     # macOS / Linux
+  py basecamp_setup.py --check-tls          # Windows
+  ```
 - **PyPI blocked entirely:** ask IT for the internal package mirror and point uv at it:
   `UV_DEFAULT_INDEX=https://<your-mirror>/simple python3 basecamp_setup.py` (macOS / Linux) or
   `$env:UV_DEFAULT_INDEX="https://<your-mirror>/simple"; py basecamp_setup.py` (Windows PowerShell)
@@ -174,3 +196,47 @@ key may not.
 Read the banner the setup cell shows: every failure names a specific next step rather than
 a raw traceback. Re-running the setup script resolves most problems, because it
 re-checks every step and tells you which one fails.
+
+---
+
+## If you want to run the steps manually
+
+The script is the recommended path. If you'd rather do it yourself, these are the same
+steps, with uv in place of the old `python -m venv` + `pip install`. Run them from the repo
+root.
+
+1. **Install uv** (see [uv won't install](#uv-wont-install) if this is blocked):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh                        # macOS / Linux
+   ```
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+   ```
+   Then open a new terminal so `uv` is on your PATH.
+2. **Create `.venv` and install the packages:** this replaces `python -m venv .venv` and
+   `pip install -r requirements.txt`. uv reads `pyproject.toml` and downloads Python 3.10+
+   for `.venv` if yours is older.
+   ```bash
+   uv sync
+   ```
+3. **Register the kernel** so VS Code and Jupyter list it:
+   ```bash
+   uv run python -m ipykernel install --user --name basecamp-exercises --display-name "Anthropic Basecamp (.venv)"
+   ```
+4. **Add your key:** copy the template and fill in one option (Anthropic API key, Bedrock
+   key, or gateway key, as described in the file):
+   ```bash
+   cp .env.example .env          # macOS / Linux
+   copy .env.example .env        # Windows
+   ```
+5. **Check your connection:**
+   ```bash
+   uv run python -c "import basecamp_setup; basecamp_setup.connect()"
+   ```
+   A line starting with ✓ means you're connected. On a certificate error, run
+   `uv run python basecamp_setup.py --check-tls`, then check again.
+
+There's no need to activate `.venv`: `uv run` uses it automatically. If you want it active
+in your shell anyway, run `source .venv/bin/activate` (macOS / Linux) or
+`.venv\Scripts\activate` (Windows). In VS Code, open a notebook and pick
+**Anthropic Basecamp (.venv)** as the kernel.

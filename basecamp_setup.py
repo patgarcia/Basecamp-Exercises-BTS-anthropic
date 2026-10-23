@@ -7,8 +7,10 @@ Run it once from the repo root:
 
 It installs uv if you don't have it, creates .venv with everything the exercises need
 (uv sync), registers the "Anthropic Basecamp (.venv)" Jupyter kernel, points VS Code at
-.venv, asks for your credentials and saves them to .env, then checks they work with a real
-call.
+.venv, asks for your credentials and saves them to .env, tests which certificates reach your
+Claude endpoint, then checks the connection with a real call.
+
+    python3 basecamp_setup.py --check-tls     re-test certificates only (no questions)
 
 The notebooks import connect() from this file, so the connection logic lives in one place.
 Only the standard library is imported at the top: the setup half runs before anything is
@@ -23,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent  # the repo root: the folder with day1/ and day2/
 # How to run this script, as people type it on this OS (python3 often opens the Store on Windows).
@@ -34,6 +37,7 @@ KERNEL_DISPLAY_NAME = "Anthropic Basecamp (.venv)"
 DEFAULT_MODEL_PREFIX = "bedrock.anthropic."  # what PwC's Bedrock gateway expects
 ENV_KEYS = ("ANTHROPIC_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION",
             "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL_PREFIX")
+TLS_MODES = ("default", "system+bundle", "system")  # values of BASECAMP_TLS; see check_tls()
 
 
 # =============================================================================
@@ -65,9 +69,20 @@ class Settings:
         self.model_prefix = setting("ANTHROPIC_MODEL_PREFIX")
         # If both credentials are set, the Anthropic-protocol key wins.
         self.provider = "anthropic" if self.api_key else "bedrock" if self.bedrock_token else None
+        # Which certificates to trust: saved by the setup script after testing this machine.
+        self.tls = setting("BASECAMP_TLS").lower() or "default"
 
     def problem(self):
         """What's missing before a client can be built, as (headline, details) — or None."""
+        if self.tls not in TLS_MODES:
+            return ("📋 BASECAMP_TLS has an unknown value",
+                    f"BASECAMP_TLS={self.tls} isn't one of: {', '.join(TLS_MODES)}.\n"
+                    "\n"
+                    "Let setup test this machine and set it, from the repo root:\n"
+                    f"    cd \"{ROOT}\"\n"
+                    f"    {SETUP_COMMAND} --check-tls\n"
+                    "\n"
+                    "Then run this again.")
         if self.provider is None:
             return ("📋 Add your credentials to continue",
                     "No key found in your shell or in .env.\n"
@@ -96,16 +111,27 @@ class Settings:
         prefix = self.model_prefix or ("anthropic." if self.provider == "bedrock" else "")
         return name if name.startswith(prefix) else prefix + name
 
+    def endpoint(self):
+        """Where your Claude calls go: the gateway if you use one, else the provider's API."""
+        if self.base_url:
+            return self.base_url
+        if self.provider == "bedrock":
+            return str(self.make_client().base_url)
+        return "https://api.anthropic.com"
+
     def make_client(self, timeout=600.0, max_retries=2):
         """Client for your route. ANTHROPIC_BASE_URL, when set, sends either kind through it."""
         import anthropic
 
+        options = {"timeout": timeout, "max_retries": max_retries}
+        context = _ssl_context(self.tls)
+        if context is not None:
+            options["http_client"] = anthropic.DefaultHttpxClient(verify=context)
         if self.provider == "bedrock":
             return anthropic.AnthropicBedrockMantle(
                 api_key=self.bedrock_token, aws_region=self.region or None,
-                base_url=self.base_url or None, timeout=timeout, max_retries=max_retries)
-        return anthropic.Anthropic(api_key=self.api_key, base_url=self.base_url or None,
-                                   timeout=timeout, max_retries=max_retries)
+                base_url=self.base_url or None, **options)
+        return anthropic.Anthropic(api_key=self.api_key, base_url=self.base_url or None, **options)
 
 
 class Connection:
@@ -197,19 +223,127 @@ def connect(model="claude-sonnet-5", fast_model="claude-haiku-4-5", big_model="c
                            "key (it starts with sk-ant-).")
         raise SystemExit("Credentials not accepted — see the message above.")
     except Exception as exc:
+        if _is_cert_error(exc):
+            _status(False, f"Couldn't verify the HTTPS certificate of {settings.endpoint()}. In a "
+                           f"terminal at the repo root, run  {SETUP_COMMAND} --check-tls  to test "
+                           "this machine's certificates, then run this again.")
+            raise SystemExit("Certificate check failed — see the message above.")
         _status(False, f"Could not reach the API{via} ({type(exc).__name__}). Check your "
                        "connection (and VPN, for a company gateway), then try again.")
         raise
 
+    model = connection.model + {
+        "system+bundle": " (certificates: system store + SSL_CERT_FILE, from BASECAMP_TLS)",
+        "system": " (certificates: system store, from BASECAMP_TLS)",
+    }.get(settings.tls, "")
     if settings.provider == "anthropic" and not gateway:
-        _status(True, f"API key verified — you're connected to Claude as {connection.model}.")
+        _status(True, f"API key verified — you're connected to Claude as {model}.")
     elif settings.provider == "anthropic":
-        _status(True, f"Gateway key verified{via} — you're connected to Claude as "
-                      f"{connection.model}.")
+        _status(True, f"Gateway key verified{via} — you're connected to Claude as {model}.")
     else:
         _status(True, f"Bedrock key verified ({settings.region or 'gateway'}){via} — you're "
-                      f"connected to Claude as {connection.model}.")
+                      f"connected to Claude as {model}.")
     return connection
+
+
+# ── Certificates (BASECAMP_TLS) ──────────────────────────────────────────────
+# Company laptops sometimes set SSL_CERT_FILE to a certificate bundle that's missing what a
+# server needs, and the SDK trusts that file instead of the system store. check_tls() tests
+# which option reaches your endpoint and saves it to .env; make_client() then uses it.
+
+def check_tls():
+    """Test which certificates verify your Claude endpoint and save the answer to .env as
+    BASECAMP_TLS (left unset when the SDK's default works). True if one works."""
+    settings = Settings()
+    saved, settings.tls = settings.tls, "default"  # test from scratch, whatever is saved
+    if settings.problem():
+        print("• No credentials in .env yet, so there's no endpoint to test. Skipped.")
+        return True
+    url = settings.endpoint()
+    host = urllib.parse.urlparse(url).hostname or url
+    if not url.startswith("https://"):
+        print(f"• {host} uses plain HTTP, so there are no certificates to check.")
+        return True
+    bundle = os.environ.get("SSL_CERT_FILE", "")
+    # The system store only differs from the default when SSL_CERT_FILE overrides it.
+    modes = ["default"] + (["system+bundle", "system"] if os.path.isfile(bundle)
+                           else ["system"] if bundle else [])
+    for mode in modes:
+        works = _tls_reaches(url, mode)
+        if works is None:
+            print(f"✗ Couldn't reach {host} at all, so certificates couldn't be tested. Check "
+                  f"your network (and VPN, for a company gateway), then run  {SETUP_COMMAND} "
+                  "--check-tls  again.")
+            return False
+        if works:
+            break
+    else:
+        print(f"✗ No certificate setup on this machine can verify {host}.\n"
+              f"  SSL_CERT_FILE: {bundle or 'not set'}"
+              f"{' (file not found)' if bundle and not os.path.isfile(bundle) else ''}\n"
+              "  Your network may re-sign HTTPS traffic with a company certificate this machine\n"
+              "  doesn't trust yet. Ask IT for it, and see SETUP.md → certificate errors.")
+        return False
+
+    if mode != saved:
+        _write_env({"BASECAMP_TLS": "" if mode == "default" else mode})
+    if mode == "default":
+        print(f"{_check_mark()} Certificates check out for {host}.")
+        return True
+    why = ("points to a file that doesn't exist" if mode == "system" and bundle
+           and not os.path.isfile(bundle) else f"({bundle}) can't verify {host} on its own")
+    store = "your system's certificate store" + (" plus that bundle" if mode == "system+bundle"
+                                                 else "")
+    print(f"{_check_mark()} SSL_CERT_FILE {why}, so the exercises will use {store}.\n"
+          f"  {'Saved' if mode != saved else 'Kept'} BASECAMP_TLS={mode} in .env. Your shell and "
+          "system settings are unchanged.")
+    return True
+
+
+def _ssl_context(mode):
+    """The certificates a BASECAMP_TLS value asks for, or None for the SDK's default (which
+    honors SSL_CERT_FILE, and otherwise uses the system store)."""
+    if mode not in ("system+bundle", "system"):
+        return None
+    import ssl
+    import truststore
+
+    context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # the system store, like a browser
+    bundle = os.environ.get("SSL_CERT_FILE", "")
+    if mode == "system+bundle" and os.path.isfile(bundle):
+        context.load_verify_locations(bundle)  # plus whatever the bundle adds
+    return context
+
+
+def _tls_reaches(url, mode):
+    """Whether `mode`'s certificates verify the server at url: True, False, or None when the
+    server can't be reached at all (offline, VPN, DNS), so certificates can't be judged."""
+    import anthropic
+
+    try:
+        context = _ssl_context(mode)
+        http = anthropic.DefaultHttpxClient(timeout=15.0, **({"verify": context} if context else {}))
+    except OSError:  # e.g. SSL_CERT_FILE names a file that isn't there
+        return False
+    try:
+        with http:
+            http.get(url)  # any HTTP answer, even an error status, means the certificate passed
+        return True
+    except Exception as exc:
+        return False if _is_cert_error(exc) else None
+
+
+def _is_cert_error(exc):
+    """True if exc, or anything that caused it, is a failed certificate check."""
+    import ssl
+
+    for _ in range(10):  # walk the chain of causes
+        if exc is None:
+            return False
+        if isinstance(exc, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _in_notebook():
@@ -267,11 +401,7 @@ def _stop(head, body):
 # =============================================================================
 
 def main():
-    for stream in (sys.stdout, sys.stderr):
-        # Windows consoles: replace characters they can't show instead of crashing. Line
-        # buffering keeps these messages in order with uv's own output.
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace", line_buffering=True)
+    _prepare_console()
     try:
         import readline  # noqa: F401 — without it, macOS cuts a pasted key off at 1,024 characters
     except ImportError:  # Windows doesn't need it
@@ -286,6 +416,8 @@ def main():
           "--name", KERNEL_NAME, "--display-name", KERNEL_DISPLAY_NAME], quiet=True)
     print(f"{_check_mark()} Kernel \"{KERNEL_DISPLAY_NAME}\" is available in VS Code and Jupyter.")
     _point_vscode_at_venv()
+    _step("Checking certificates")
+    _check_tls(uv)
     _step("Checking your connection to Claude")
     check = subprocess.run([uv, "run", "--no-sync", "python", "-c",
                             "import basecamp_setup; basecamp_setup.connect()"], cwd=ROOT)
@@ -295,6 +427,33 @@ def main():
     print(f"\n{_check_mark()} You're all set! Open any notebook in VS Code; if it doesn't pick the "
           f"kernel by itself, click the kernel name (top right) and choose \"{KERNEL_DISPLAY_NAME}\".")
     _open_vscode()
+
+
+def check_tls_command():
+    """basecamp_setup.py --check-tls: re-test certificates without redoing the whole setup."""
+    _prepare_console()
+    uv = _find_uv()
+    if not uv or not (ROOT / ".venv").is_dir():
+        raise SystemExit(f"Run the full setup first:  {SETUP_COMMAND}")
+    _step("Checking certificates")
+    if not _check_tls(uv):
+        raise SystemExit(1)
+    print("Done. If a notebook is open, run its setup cell again.")
+
+
+def _check_tls(uv):
+    """check_tls() needs the SDK, so it runs in .venv. True if it found certificates that work."""
+    return subprocess.run([uv, "run", "--no-sync", "python", "-c",
+                           "import sys, basecamp_setup; sys.exit(not basecamp_setup.check_tls())"],
+                          cwd=ROOT).returncode == 0
+
+
+def _prepare_console():
+    for stream in (sys.stdout, sys.stderr):
+        # Windows consoles: replace characters they can't show instead of crashing. Line
+        # buffering keeps these messages in order with uv's own output.
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace", line_buffering=True)
 
 
 def _step(title):
@@ -347,21 +506,54 @@ def _install_uv():
     return uv
 
 
+_CERT_FAILURE = re.compile(r"invalid peer certificate|UnknownIssuer|certificate verify failed",
+                           re.IGNORECASE)
+
+
 def _sync(uv):
-    """uv sync, retrying with the OS certificate store if a download fails — company networks
-    that inspect TLS traffic sign it with a certificate only the OS store trusts."""
-    if subprocess.run([uv, "sync"], cwd=ROOT).returncode == 0:
+    """uv sync. If a download fails on a certificate, retry with the system certificate store,
+    which trusts what company networks re-sign HTTPS with. uv ignores that store while
+    SSL_CERT_FILE is set, so the retry also drops it — for uv only, never your shell."""
+    ok, output = _uv_sync(uv, os.environ)
+    if ok:
         return
-    print("\nRetrying with your system's certificates (common behind a company proxy)…")
-    env = dict(os.environ, UV_SYSTEM_CERTS="1", UV_NATIVE_TLS="1")  # new and old uv names
-    if subprocess.run([uv, "sync"], cwd=ROOT, env=env).returncode == 0:
-        return
+    if _CERT_FAILURE.search(output):
+        env = dict(os.environ, UV_SYSTEM_CERTS="1", UV_NATIVE_TLS="1")  # new and old uv names
+        dropped = [name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if env.pop(name, None)]
+        if dropped:
+            print(f"\nuv couldn't verify a download using {' / '.join(dropped)} (set on this "
+                  "machine). Retrying with your system's certificate store, for this install "
+                  "only…")
+        else:
+            print("\nRetrying with your system's certificate store (common behind a company "
+                  "proxy)…")
+        ok, output = _uv_sync(uv, env)
+        if ok:
+            return
+    if _CERT_FAILURE.search(output):
+        raise SystemExit(
+            "\n✗ Couldn't verify the package server's certificate, even with your system's\n"
+            "  certificate store. Your network may re-sign HTTPS with a company certificate this\n"
+            "  machine doesn't trust yet: ask IT for it, or for an internal package mirror.\n"
+            "  More in SETUP.md → certificate errors.")
     mirror = ('$env:UV_DEFAULT_INDEX="https://<your-mirror>/simple"; ' if os.name == "nt"
               else "UV_DEFAULT_INDEX=https://<your-mirror>/simple ") + SETUP_COMMAND
     raise SystemExit(
         "\n✗ Couldn't install the packages. If your company blocks PyPI, ask IT for the internal\n"
         f"  package mirror and run:  {mirror}\n"
         "  Behind a proxy? Set HTTPS_PROXY first. More in SETUP.md.")
+
+
+def _uv_sync(uv, env):
+    """Run uv sync, showing its output as it comes; returns (succeeded, output)."""
+    process = subprocess.Popen([uv, "sync"], cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                               errors="replace")
+    lines = []
+    for line in process.stdout:
+        print(line, end="")
+        lines.append(line)
+    return process.wait() == 0, "".join(lines)
 
 
 # ── VS Code ──────────────────────────────────────────────────────────────────
@@ -526,7 +718,15 @@ def _write_env(values):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Partner Basecamp setup. With no options: the full one-time setup.")
+    parser.add_argument("--check-tls", action="store_true",
+                        help="only re-test which certificates reach your Claude endpoint and "
+                             "save the result to .env (BASECAMP_TLS); asks nothing")
+    args = parser.parse_args()
     try:
-        main()
+        check_tls_command() if args.check_tls else main()
     except KeyboardInterrupt:
         raise SystemExit(f"\nStopped. Run  {SETUP_COMMAND}  again whenever you're ready.")

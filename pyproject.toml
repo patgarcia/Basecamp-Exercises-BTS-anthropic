@@ -11,8 +11,9 @@ version = "1.0.0"
 description = "Partner Basecamp exercise notebooks"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic[bedrock]>=0.69",  # every exercise; [bedrock] also covers Amazon Bedrock keys
+    "anthropic[bedrock]>=1.6",   # every exercise; [bedrock] also covers Amazon Bedrock keys
     "python-dotenv>=1.0",        # every exercise: reads .env
+    "truststore>=0.10",          # trusts the system certificate store (BASECAMP_TLS)
     "ipykernel>=6",              # the "Anthropic Basecamp (.venv)" notebook kernel
     "matplotlib>=3.7",           # Day 1/03 Prompt Rescue
     "tabulate>=0.9",             # Day 2/02 Inference Optimization

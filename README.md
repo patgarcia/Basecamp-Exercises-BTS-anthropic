@@ -4,6 +4,20 @@
 
 This repository contains all notebooks and supporting files for Partner Basecamp sessions. Materials are organized by day and session in the order they run.
 
+> [!IMPORTANT]
+> **Setup is one command.** In a terminal at the repo root (the folder that contains `day1` and `day2`), run:
+>
+> ```bash
+> python3 basecamp_setup.py        # macOS / Linux
+> py basecamp_setup.py             # Windows (or: python basecamp_setup.py)
+> ```
+>
+> Follow the prompts: it installs everything, asks for your key, and checks your connection. There's nothing else to install by hand.
+>
+> **Using an AI coding assistant?** Ask it to "set up this repo". [AGENTS.md](AGENTS.md) tells it to open this script in a terminal window, where you paste your key yourself.
+
+**AI agents:** your instructions for this repo are in [AGENTS.md](AGENTS.md) (Claude Code loads them through [CLAUDE.md](CLAUDE.md)). Read it before setting up or running anything.
+
 ---
 
 ## How to download
@@ -94,3 +108,5 @@ py basecamp_setup.py             # Windows — or: python basecamp_setup.py if p
 ```
 
 It installs [uv](https://docs.astral.sh/uv/) if needed, creates `.venv` with everything the exercises use, registers the **Anthropic Basecamp (.venv)** kernel, asks for your key, and checks the connection. Your system Python is never touched, and no admin rights are needed. If you hit a wall, **[SETUP.md](SETUP.md)** is the one-page fix — it covers the VS Code "wrong kernel" trap, corporate proxies, and Bedrock or gateway keys.
+
+Check the [SETUP.md](SETUP.md) file for troubleshooting, Bedrock and gateway keys, and [the manual setup steps](SETUP.md#if-you-want-to-run-the-steps-manually).
